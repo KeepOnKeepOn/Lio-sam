@@ -15,7 +15,6 @@
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
-#include <opencv/cv.h>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -30,6 +29,8 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/crop_box.h> 
 #include <pcl_conversions/pcl_conversions.h>
+
+#include <opencv2/opencv.hpp>
 
 #include <tf/LinearMath/Quaternion.h>
 #include <tf/transform_listener.h>
@@ -212,7 +213,7 @@ public:
         extRot = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extRotV.data(), 3, 3);
         extRPY = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extRPYV.data(), 3, 3);
         extTrans = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extTransV.data(), 3, 1);
-        extQRPY = Eigen::Quaterniond(extRPY).inverse();
+        extQRPY = Eigen::Quaterniond(extRPY).inverse();//extQROY->q_bl quaternion from lidar frame to baselink(imu) frame
 
         nh.param<float>("lio_sam/edgeThreshold", edgeThreshold, 0.1);
         nh.param<float>("lio_sam/surfThreshold", surfThreshold, 0.1);
@@ -248,7 +249,7 @@ public:
 
         usleep(100);
     }
-
+    //transform imu data from imu frame to lidar frame
     sensor_msgs::Imu imuConverter(const sensor_msgs::Imu& imu_in)
     {
         sensor_msgs::Imu imu_out = imu_in;
@@ -264,9 +265,9 @@ public:
         imu_out.angular_velocity.x = gyr.x();
         imu_out.angular_velocity.y = gyr.y();
         imu_out.angular_velocity.z = gyr.z();
-        // rotate roll pitch yaw
+        // rotate attitude : roll pitch yaw
         Eigen::Quaterniond q_from(imu_in.orientation.w, imu_in.orientation.x, imu_in.orientation.y, imu_in.orientation.z);
-        Eigen::Quaterniond q_final = q_from * extQRPY;
+        Eigen::Quaterniond q_final = q_from * extQRPY;//extQROY->q_bl quaternion from lidar frame to baselink(imu) frame
         imu_out.orientation.x = q_final.x();
         imu_out.orientation.y = q_final.y();
         imu_out.orientation.z = q_final.z();
