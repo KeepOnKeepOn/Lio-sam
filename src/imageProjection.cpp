@@ -3,12 +3,13 @@
 
 struct VelodynePointXYZIRT
 {
-    PCL_ADD_POINT4D
-    PCL_ADD_INTENSITY;
-    uint16_t ring;
-    float time;
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    PCL_ADD_POINT4D                  //位置
+    PCL_ADD_INTENSITY;               //激光点反射强度 float intensity;
+    uint16_t ring;                   //扫描线
+    float time;                      //时间戳，记录相对于当前帧第一个激光点的时差，第一个点time=0
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW  //内存16字节对齐，EIGEN SSE优化要求
 } EIGEN_ALIGN16;
+// 注册为PCL点云格式
 POINT_CLOUD_REGISTER_POINT_STRUCT (VelodynePointXYZIRT,
     (float, x, x) (float, y, y) (float, z, z) (float, intensity, intensity)
     (uint16_t, ring, ring) (float, time, time)
@@ -32,78 +33,91 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPointXYZIRT,
 
 // Use the Velodyne point format as a common representation
 using PointXYZIRT = VelodynePointXYZIRT;
-
+//IMU数据队列长度
 const int queueLength = 2000;
 
 class ImageProjection : public ParamServer
 {
 private:
-
+    //IMU队列、odom队列互斥锁
     std::mutex imuLock;
     std::mutex odoLock;
-
+    //发布当前帧校正后点云，有效点
     ros::Subscriber subLaserCloud;
     ros::Publisher  pubLaserCloud;
-    
+    //imu数据队列(原始数据，转lidar系下)
     ros::Publisher pubExtractedCloud;
     ros::Publisher pubLaserCloudInfo;
-
+    //imu数据队列(原始数据，转lidar系下)
     ros::Subscriber subImu;
     std::deque<sensor_msgs::Imu> imuQueue;
-
+    //imu里程计队列
     ros::Subscriber subOdom;
     std::deque<nav_msgs::Odometry> odomQueue;
-
+    //激光点云数据队列
     std::deque<sensor_msgs::PointCloud2> cloudQueue;
+    //队列front帧，作为当前处理帧点云
     sensor_msgs::PointCloud2 currentCloudMsg;
-
+    //当前激光帧起止时刻间对应的imu数据，计算相对于起始时刻的旋转增量，以及时间戳；用于插值计算当前激光帧起止时间范围内，每一时刻的旋转姿态
     double *imuTime = new double[queueLength];
     double *imuRotX = new double[queueLength];
     double *imuRotY = new double[queueLength];
     double *imuRotZ = new double[queueLength];
-
+    
     int imuPointerCur;
     bool firstPointFlag;
     Eigen::Affine3f transStartInverse;
-
+    //当前帧原始激光点云
     pcl::PointCloud<PointXYZIRT>::Ptr laserCloudIn;
     pcl::PointCloud<OusterPointXYZIRT>::Ptr tmpOusterCloudIn;
+    //当前帧运动畸变校正之后的激光点云
     pcl::PointCloud<PointType>::Ptr   fullCloud;
+    //从fullcloud中提取的有效点
     pcl::PointCloud<PointType>::Ptr   extractedCloud;
 
     int deskewFlag;
     cv::Mat rangeMat;
 
     bool odomDeskewFlag;
+    //当前激光帧起止时刻对应imu里程计位姿变换，该变换对应的平移增量；用于插值计算当前激光帧起止时间范围内，每一时刻的位置
     float odomIncreX;
     float odomIncreY;
     float odomIncreZ;
-
+    //当前帧激光点云运动畸变校正之后的数据，包括点云数据、初始位姿、姿态角等，发布给featureExatruction进行特征提取
     lio_sam::cloud_info cloudInfo;
+    //当前帧起始时刻
     double timeScanCur;
+    //当前帧结束时刻
     double timeScanEnd;
+    //当前帧header，包含时间戳信息
     std_msgs::Header cloudHeader;
 
     vector<int> columnIdnCountVec;
 
 
 public:
+    //构造函数
     ImageProjection():
     deskewFlag(0)
     {
+        //订阅原始IMU数据
         subImu        = nh.subscribe<sensor_msgs::Imu>(imuTopic, 2000, &ImageProjection::imuHandler, this, ros::TransportHints().tcpNoDelay());
+        //订阅IMU里程计，由imuPreintegration积分计算得到的每时刻IMU位姿
         subOdom       = nh.subscribe<nav_msgs::Odometry>(odomTopic+"_incremental", 2000, &ImageProjection::odometryHandler, this, ros::TransportHints().tcpNoDelay());
+        //订阅原始lidar数据
         subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>(pointCloudTopic, 5, &ImageProjection::cloudHandler, this, ros::TransportHints().tcpNoDelay());
-
+        //发布当前激光帧运动畸变校正后的点云，有效点
         pubExtractedCloud = nh.advertise<sensor_msgs::PointCloud2> ("lio_sam/deskew/cloud_deskewed", 1);
+        //发布当前激光帧运动畸变校正后的点云信息
         pubLaserCloudInfo = nh.advertise<lio_sam::cloud_info> ("lio_sam/deskew/cloud_info", 1);
-
+        //为变量申请内存
         allocateMemory();
+        //重置参数
         resetParameters();
-
+        //pcl日志级别，只打开ERROR日志
         pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
     }
-
+    //初始化，为变量申请内存
     void allocateMemory()
     {
         laserCloudIn.reset(new pcl::PointCloud<PointXYZIRT>());
@@ -121,7 +135,7 @@ public:
 
         resetParameters();
     }
-
+    //重置参数，接收每帧lidar数据都要重置这些参数
     void resetParameters()
     {
         laserCloudIn->clear();
@@ -145,11 +159,14 @@ public:
     }
 
     ~ImageProjection(){}
-
+    
+    /* IMU原始数据回调函数
+    IMU原始测量数据转换到lidar系下，加速度、角速度、RPY姿态 */
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imuMsg)
     {
+        //imu原始测量数据转换到lidar系，加速度、角速度、RPY
         sensor_msgs::Imu thisImu = imuConverter(*imuMsg);
-
+        //上锁，添加数据时队列不可用
         std::lock_guard<std::mutex> lock1(imuLock);
         imuQueue.push_back(thisImu);
 
@@ -170,30 +187,49 @@ public:
         // cout << "IMU roll pitch yaw: " << endl;
         // cout << "roll: " << imuRoll << ", pitch: " << imuPitch << ", yaw: " << imuYaw << endl << endl;
     }
-
+    //订阅IMU里程计，由imuPreintegration积分计算得到的每时刻imu位姿
     void odometryHandler(const nav_msgs::Odometry::ConstPtr& odometryMsg)
     {
         std::lock_guard<std::mutex> lock2(odoLock);
         odomQueue.push_back(*odometryMsg);
     }
-
+    /**
+     * 订阅原始lidar数据
+     * 1、添加一帧激光点云到队列，取出最早一帧作为当前帧，计算起止时间戳，检查数据有效性
+     * 2、当前帧起止时刻对应的imu数据、imu里程计数据处理
+     *   imu数据：
+     *   1) 遍历当前激光帧起止时刻之间的imu数据，初始时刻对应imu的姿态角RPY设为当前帧的初始姿态角
+     *   2) 用角速度、时间积分，计算每一时刻相对于初始时刻的旋转量，初始时刻旋转设为0
+     *   imu里程计数据：
+     *   1) 遍历当前激光帧起止时刻之间的imu里程计数据，初始时刻对应imu里程计设为当前帧的初始位姿
+     *   2) 用起始、终止时刻对应imu里程计，计算相对位姿变换，保存平移增量
+     * 3、当前帧激光点云运动畸变校正
+     *   1) 检查激光点距离、扫描线是否合规
+     *   2) 激光运动畸变校正，保存激光点
+     * 4、提取有效激光点，存extractedCloud
+     * 5、发布当前帧校正后点云，有效点
+     * 6、重置参数，接收每帧lidar数据都要重置这些参数
+    */
     void cloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
     {
+        //添加一帧激光点云到点云队列，取出最早一帧作为当前帧，计算起止时间戳，检查数据有效性
         if (!cachePointCloud(laserCloudMsg))
             return;
-
+        //当前帧起止时刻对应的imu数据、imu里程计数据处理
         if (!deskewInfo())
             return;
-
+        //当前帧激光点云运动畸变校正
+        //1.检查激光点距离、扫描线是否合规
+        //2.激光运动畸变校正，保存激光点
         projectPointCloud();
-
+        //提取有效激光点，存extractedCloud
         cloudExtraction();
-
+        //发布当前帧校正后点云，有效点
         publishClouds();
-
+        //重置参数，接收每帧lidar数据都要重置这些参数
         resetParameters();
     }
-
+    //添加一帧激光点云到点云队列，取出最早一帧作为当前帧，计算起止时间戳，检查数据有效性
     bool cachePointCloud(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
     {
         // cache point cloud
@@ -201,11 +237,12 @@ public:
         if (cloudQueue.size() <= 2)
             return false;
 
-        // convert cloud
+        // 取出激光点云队列最早的一帧
         currentCloudMsg = std::move(cloudQueue.front());
         cloudQueue.pop_front();
         if (sensor == SensorType::VELODYNE || sensor == SensorType::LIVOX)
-        {
+        {   
+            //转换成pcl点云格式
             pcl::moveFromROSMsg(currentCloudMsg, *laserCloudIn);
         }
         else if (sensor == SensorType::OUSTER)
@@ -234,17 +271,19 @@ public:
 
         // get timestamp
         cloudHeader = currentCloudMsg.header;
+        //当前帧起始时刻
         timeScanCur = cloudHeader.stamp.toSec();
+        //当前帧结束时刻，注：点云中激光点的time记录相对于当前帧第一个激光点的时差，第一个点time=0
         timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
 
-        // check dense flag
+        // check dense flag 
         if (laserCloudIn->is_dense == false)
-        {
+        {//存在无效点，Nan或者Inf
             ROS_ERROR("Point cloud is not in dense format, please remove NaN points first!");
             ros::shutdown();
         }
 
-        // check ring channel
+        // check ring channel 检查是否存在ring通道，注意static，只检查一次
         static int ringFlag = 0;
         if (ringFlag == 0)
         {
@@ -264,7 +303,7 @@ public:
             }
         }
 
-        // check point time
+        // check point time 检查是否存在time通道
         if (deskewFlag == 0)
         {
             deskewFlag = -1;
@@ -282,21 +321,27 @@ public:
 
         return true;
     }
-
+    //当前帧起止时刻对应的imu数据、imu里程计数据处理
     bool deskewInfo()
     {
         std::lock_guard<std::mutex> lock1(imuLock);
         std::lock_guard<std::mutex> lock2(odoLock);
 
-        // make sure IMU data available for the scan
+        // make sure IMU data available for the scan 要求imu数据能够覆盖雷达数据
         if (imuQueue.empty() || imuQueue.front().header.stamp.toSec() > timeScanCur || imuQueue.back().header.stamp.toSec() < timeScanEnd)
         {
             ROS_DEBUG("Waiting for IMU data ...");
             return false;
         }
-
+        /* 当前帧对应imu数据处理
+        1、遍历当前激光帧起止时刻之间的imu数据，初始时刻对应imu的姿态角RPY设为当前帧的初始姿态角
+        2、用角速度、时间积分，计算每一时刻相对于初始时刻的旋转量，初始时刻旋转设为0
+        注：imu数据都已经转换到lidar系下了 */
         imuDeskewInfo();
-
+        /* 当前帧对应imu里程计处理
+        1、遍历当前激光帧起止时刻之间的imu里程计数据，初始时刻对应imu里程计设为当前帧的初始位姿
+        2、用起始、终止时刻对应imu里程计，计算相对位姿变换，保存平移增量
+        注：imu数据都已经转换到lidar系下了 */
         odomDeskewInfo();
 
         return true;

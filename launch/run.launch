@@ -1,7 +1,9 @@
 <launch>
 
     <arg name="project" default="lio_sam"/>
-     <node pkg="rs_to_velodyne" name="rs_to_velodyne" type="rs_to_velodyne"  args="XYZIRT XYZIRT"   output="screen"/>
+    <node pkg="rs_to_velodyne" name="rs_to_velodyne" type="rs_to_velodyne"  args="XYZIRT XYZIRT"   output="screen">
+        <param name="timeOffset" type="double" value="-0.026092"/>
+    </node>
     <!-- Parameters -->
     <rosparam file="$(find lio_sam)/config/params.yaml" command="load" />
 
