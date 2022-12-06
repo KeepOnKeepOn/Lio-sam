@@ -464,28 +464,35 @@ public:
 
         return false;
     }
-
+    /**
+     * 订阅imu原始数据
+     * 1、用上一帧激光里程计时刻对应的状态、偏置，施加从该时刻开始到当前时刻的imu预积分量，得到当前时刻的状态，也就是imu里程计
+     * 2、imu里程计位姿转到lidar系，发布里程计
+    */
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imu_raw)
     {
         std::lock_guard<std::mutex> lock(mtx);
-
+        //将imu原始测量数据转换到雷达坐标系下，加速度、角速度和姿态信息
         sensor_msgs::Imu thisImu = imuConverter(*imu_raw);
-
+        //将IMU信息存到两个队列里，一个用于优化，一个用于重积分
         imuQueOpt.push_back(thisImu);
         imuQueImu.push_back(thisImu);
 
         if (doneFirstOpt == false)
             return;
 
-        double imuTime = ROS_TIME(&thisImu);
-        double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_imu);
+        double imuTime = ROS_TIME(&thisImu);//当前帧imu时间戳
+        double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_imu);//获取相邻两帧imu数据时间差
         lastImuT_imu = imuTime;
 
         // integrate this single imu message
+        //记录imu的测量信息
+        //此时用的imu预积分器为imuIntegeratorImu_
         imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu.linear_acceleration.x, thisImu.linear_acceleration.y, thisImu.linear_acceleration.z),
                                                 gtsam::Vector3(thisImu.angular_velocity.x,    thisImu.angular_velocity.y,    thisImu.angular_velocity.z), dt);
 
         // predict odometry
+        //利用上一时刻的imu里程计状态信息PVQ和偏置信息，预积分出当前时刻imu里程计状态信息PVQ
         gtsam::NavState currentState = imuIntegratorImu_->predict(prevStateOdom, prevBiasOdom);
 
         // publish odometry
@@ -496,8 +503,8 @@ public:
 
         // transform imu pose to ldiar
         gtsam::Pose3 imuPose = gtsam::Pose3(currentState.quaternion(), currentState.position());
-        gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);
-
+        gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);//获取估计的雷达位姿信息
+        
         odometry.pose.pose.position.x = lidarPose.translation().x();
         odometry.pose.pose.position.y = lidarPose.translation().y();
         odometry.pose.pose.position.z = lidarPose.translation().z();

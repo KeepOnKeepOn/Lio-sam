@@ -10,6 +10,7 @@
     <!--- LOAM -->
     <include file="$(find lio_sam)/launch/include/module_loam.launch" />
 
+    <node pkg="tf2_ros" name="tf_pub" type="static_transform_publisher" args="0.20, 0.15, 0.06 2.06298 -3.14159  1.56207 base_link camera_link" />
     <!--- Robot State TF -->
     <include file="$(find lio_sam)/launch/include/module_robot_state_publisher.launch" />
 
